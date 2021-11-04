@@ -1,0 +1,25 @@
+This very primitive multi-threaded web-crawler has three arguments, respectively query, page number to crawl and maximum thread number.
+
+To generate priortized log for query 'brooklyn union', you can simply type command "python crawler.py -p 'brooklyn union' -p 10000 -t 50" (or just 'python crawler.py' with default setting). This crawler will crawl 4-5 pages per second and you will get the result after around 40 minutes.
+
+If you'd like results from simply BFS, you can use command "python naivecrawler.py -p 'brooklyn union' -p 10000 -t 50'. The naive crawler is faster and crawls 10-11 pages per second.
+
+We will focus on crawler with priority score.
+
+The main class named 'Crawler' will initialize 10 seed pages from Google as well as several data structures to store necessary information such as novelty of a domain. All pages to be crawled are store in the priority queue 'queue.PriorityQueue()'.
+
+It has a method called 'RobotcanFetch' with a parameter 'url'. This method will follow the Robot Exclusion Protocol and check whether a page can be fetched. The Crawler has a cache where the method can first look up.
+
+If the url is new seen, survived the robot exclusion protocol and the file type is not in the black list (we do not want to crawl large media files), the Crawler will dispatch a worker thread to actually do the fetch and parse job.
+
+The worker thread is called 'FetchandParse'. It has a parser which is an instance of class 'LinksExtractor'. The extractor will return all hyperlinks from a page by getting 'href' attributes from all 'a' tags.
+
+If the content type is 'text/html' and the return code is 200, the crawler will use the extractor to parse the html and update novelty and importance scores.
+
+I use min-heap in the priority queue which means the lower the score, the higher the priority. The score is equal to importance plus novelty while the importance is always negative(initially -1) and novelty always positive(initially 1). So if we have lower importance and novelty, the score is lower and priority is higher. Initially I set the seeds' novelty as 1 and importance increasing according to the order returned by Google.
+
+Each time we parse a url, we increase the novelty score of the url's domain -- top and second level domain -- by 10. And we get all the links from the crawled page, excluding those visited before and not beginning with http or https. We handle the relative path by concatenating its base. If the link is already in the queue which means there is a new url links to it, we decrease the importance by 1. If it's a new seen url, we set the importance to -1. If the url's domain is new, we set the novelty to current depth plus 1.
+
+We limit at most 100 urls added to the queue per page. We also limit the queue size to 200 by discarding urls with low priority.
+
+The Crawler will record information of actually crawled pages and has a 'log' method to finally dump it into a CSV file. It will also print current crawled number and current speed on the terminal as well.
