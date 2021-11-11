@@ -22,13 +22,18 @@ Properties properties({{"user", "root"}, {"password", "123456"}});
 // Establish Connection
 Connection* conn(driver->connect(url, properties));
 
-#define N 3213835
-// 3391243580 / N
-// the average length of documents in the collection
-#define d_avg 1055
+// pointer to page table
+std::unique_ptr<sql::PreparedStatement> urldb(conn->prepareStatement("SELECT url FROM pgurl WHERE id=?"));
 
-ifstream inverted_index("index_nfinal.bin", ios::binary);
-ifstream pgtable("page_table.bin", ios::binary);
+#define N 3213835
+// 3192517977 / N
+// the average length of documents in the collection
+#define d_avg 993
+
+vector<uint32_t> pgsize(N, 0);
+
+ifstream inverted_index_file("index_nfinal.bin", ios::binary);
+ifstream pgsize_file("page_size.bin", ios::binary);
 
 /** Helper function for Var-Byte decoding **/
 void VBDecode(deque<uint8_t> &dq, vector<uint32_t> &buffer) {
@@ -60,30 +65,35 @@ vector<string> split(const string &s, char delim) {
 
 /** Data structure for search result **/
 class result {
-    uint32_t did;
 public:
-    string url;
+    uint32_t did;
     double score;
     // term occurrence
     vector<uint32_t> occur1;
     vector<pair<string, uint32_t> > occur2;
-    result (uint32_t did, string url, double score, vector<uint32_t> &occurrence) {
-        this->did   = did;
-        this->url   = url;
-        this->score = score;
+    // term score
+    vector<double> ts1;
+    vector<pair<string, double> > ts2;
+    result (uint32_t did, double score, 
+        vector<uint32_t> &occurrence, vector<double> &term_score) {
+        this->did    = did;
+        this->score  = score;
         this->occur1 = occurrence;
+        this->ts1    = term_score;
     }
-    result (uint32_t did, string url, double score, vector<pair<string, uint32_t> > &occurrence) {
-        this->did   = did;
-        this->url   = url;
-        this->score = score;
+    result (uint32_t did, double score, 
+        vector<pair<string, uint32_t> > &occurrence,
+        vector<pair<string, double> > &term_score) {
+        this->did    = did;
+        this->score  = score;
         this->occur2 = occurrence;
+        this->ts2    = term_score;
     }
 };
 class result_comp {
 public:
     bool operator() (const result* r1, const result* r2) {
-        return r1->score < r2->score;
+        return r1->score > r2->score;
     }
 };
 
@@ -94,6 +104,8 @@ class list_pointer {
     // METADATA of list
     vector<uint32_t> lastID;
     vector<uint32_t> chukSZ;
+    // list content (compressed)
+    vector<char> compressed_list;
     // start & end of list
     uint64_t start;
     uint64_t end;
@@ -105,8 +117,8 @@ class list_pointer {
     /** 
      * CURRENT STATUS in list
      **/
-    // current offset in inverted index
-    uint64_t offset;
+    // current offset in inverted list
+    uint64_t offset = 0;
     // lastID from previous chunk
     uint32_t base_did = 0;
     // current did
@@ -115,8 +127,6 @@ class list_pointer {
     uint32_t cblock = 0;
     // current did token freq, i.e., frequency of term t in document d
     uint32_t f_dt;
-    // current url, associate with current did
-    string url;
 public:
     list_pointer(string term, uint64_t start, uint64_t end, uint32_t freq) {
         // read from lexicon
@@ -124,46 +134,41 @@ public:
         this->start = start;
         this->end   = end;
         this->f_t   = freq;
-        inverted_index.seekg(start);
+        
+        inverted_index_file.seekg(start);
         num_of_chks = ceil(f_t / 128.);
-        offset = start + num_of_chks * 8;
-        uint32_t tmp;
-        for (int i = 0; i < num_of_chks; i ++) {
-            inverted_index.read(reinterpret_cast<char *>(&tmp), sizeof(tmp));
-            lastID.push_back(tmp);
-        }
-        for (int i = 0; i < num_of_chks; i ++) {
-            inverted_index.read(reinterpret_cast<char *>(&tmp), sizeof(tmp));
-            chukSZ.push_back(tmp);
-        }
+        
+        lastID.assign(num_of_chks, 0);
+        inverted_index_file.read(reinterpret_cast<char *>(&lastID[0]), num_of_chks*sizeof(lastID[0]));
+        
+        chukSZ.assign(num_of_chks, 0);
+        inverted_index_file.read(reinterpret_cast<char *>(&chukSZ[0]), num_of_chks*sizeof(chukSZ[0]));
+
+        // list content (compressed)
+        compressed_list.assign(end - start, 0);
+        inverted_index_file.read(reinterpret_cast<char *>(&compressed_list[0]), compressed_list.size());
     }
 
     // disjunctive search only
     int index = 0;
     vector<uint32_t> didlist;
     vector<uint32_t> freqlist;
-    vector<double> scorelist;
-    vector<string> urllist;
+    vector<double>   scorelist;
     void get_payload() {
-        inverted_index.seekg(offset);
-        deque<uint8_t> list;
         for (int i = 0; i < num_of_chks; i ++) {
-            for (int j = 0; j < chukSZ[i]; j ++) {
-                uint8_t b;
-                inverted_index.read(reinterpret_cast<char *>(&b), sizeof(b));
-                list.push_back(b);
-            }
-            vector<uint32_t> buffer;
-            VBDecode(list, buffer);
+            deque<uint8_t> compressed_block(compressed_list.begin()+offset, compressed_list.begin()+offset+chukSZ[i]);
+            vector<uint32_t> decoded_block;
+            VBDecode(compressed_block, decoded_block);
             cdid = base_did; // 0
-            for (int i = 0; i < buffer.size() / 2; i ++) {
-                cdid += buffer[i];
+            for (int i = 0; i < decoded_block.size() / 2; i ++) {
+                cdid += decoded_block[i];
                 didlist.push_back(cdid);
-                f_dt = buffer[buffer.size() / 2 + i];
+                f_dt  = decoded_block[decoded_block.size() / 2 + i];
                 freqlist.push_back(f_dt);
                 scorelist.push_back(get_score());
-                urllist.push_back(url);
             }
+            base_did = cdid;
+            offset += chukSZ[i];
         }
     }
 
@@ -176,20 +181,14 @@ public:
             if (cblock >= num_of_chks)
                 return -1;
         }
-        inverted_index.seekg(offset);
-        deque<uint8_t> list;
-        for (int i = 0; i < chukSZ[cblock]; i ++) {
-            uint8_t b;
-            inverted_index.read(reinterpret_cast<char *>(&b), sizeof(b));
-            list.push_back(b);
-        }
-        vector<uint32_t> buffer;
-        VBDecode(list, buffer);
+        deque<uint8_t> compressed_block(compressed_list.begin()+offset, compressed_list.begin()+offset+chukSZ[cblock]);
+        vector<uint32_t> decoded_block;
+        VBDecode(compressed_block, decoded_block);
         cdid = base_did;
-        for (int i = 0; i < buffer.size() / 2; i ++) {
-            cdid += buffer[i];
+        for (int i = 0; i < decoded_block.size() / 2; i ++) {
+            cdid += decoded_block[i];
             if (cdid >= k) {
-                f_dt = buffer[buffer.size() / 2 + i];
+                f_dt = decoded_block[decoded_block.size() / 2 + i];
                 return cdid;
             }
         }
@@ -197,23 +196,11 @@ public:
     }
 
     double get_score() {
-        // Seek in page table
-        pgtable.seekg(cdid * 1024);
-        char *buf = new char[1020];
-        pgtable.read(buf, 1020);
-        url.assign(buf);
-        delete []buf;
-        int d;
-        pgtable.read(reinterpret_cast<char *>(&d), sizeof(int));
-
-        // BM25
-        double K = 1.2 * (0.25 + 0.75 * d / d_avg);
-        double score = log((N - f_t + 0.5) / (f_t + 0.5)) * (2.2 * f_dt / (K + f_dt));
-        return score;
+        double K = 1.2 * (0.25 + 0.75 * pgsize[cdid] / d_avg);
+        return log((N - f_t + 0.5) / (f_t + 0.5)) * (2.2 * f_dt / (K + f_dt));
     }
 
     string get_term() const { return term; }
-    string get_current_url() const { return url; }
     uint32_t get_current_fdt() const { return f_dt; }
     uint32_t get_ft() const { return f_t; }
 };
@@ -226,21 +213,18 @@ class elem {
     uint32_t lp;
     uint32_t did;
     uint32_t freq;
-    double score;
-    string url;
+    double   score;
 public:
-    elem (uint32_t lp, uint32_t did, uint32_t freq, double score, string url) {
+    elem (uint32_t lp, uint32_t did, uint32_t freq, double score) {
         this->lp = lp;
         this->did = did;
         this->freq = freq;
         this->score = score;
-        this->url = url;
     }
     uint32_t get_lp() const {return lp;}
     uint32_t get_did() const {return did;}
     uint32_t get_freq() const {return freq;}
     double   get_score() const {return score;}
-    string   get_url() const {return url;}
 };
 class comp {
 public:
@@ -259,15 +243,15 @@ void query_processer(vector<string> &terms, bool conj) {
      * Get information from Lexicon
      **/
     // Create a new PreparedStatement
-    std::unique_ptr<sql::PreparedStatement> stmnt(conn->prepareStatement("SELECT start, end, freq FROM lexicon WHERE term=?"));
-    std::unique_ptr<sql::PreparedStatement> snippet(conn->prepareStatement("SELECT text FROM docs WHERE url=?"));
+    std::unique_ptr<sql::PreparedStatement> lexicondb(conn->prepareStatement("SELECT start, end, freq FROM lexicon WHERE term=?"));
+    std::unique_ptr<sql::PreparedStatement> contentdb(conn->prepareStatement("SELECT text FROM docs WHERE url=?"));
     int num = terms.size();
     vector<list_pointer *> lp;
     for (int i = 0; i < num; i ++) {
         // Bind values to SQL statement
-        stmnt->setString(1, terms[i]);
+        lexicondb->setString(1, terms[i]);
         // Execute query
-        ResultSet *res = stmnt->executeQuery();
+        ResultSet *res = lexicondb->executeQuery();
         // Loop through and print results
         uint64_t start;
         uint64_t end;
@@ -281,85 +265,120 @@ void query_processer(vector<string> &terms, bool conj) {
     }
     if (lp.empty()) return;
 
+    cout << "--------------------" << endl;
+    cout << "INVERTED LIST LENGTH" << endl;
+    for (int i = 0; i < lp.size(); i ++) {
+        cout << lp[i]->get_term() << setw(20 - lp[i]->get_term().size()) << lp[i]->get_ft() << endl;
+    }
+    cout << "--------------------" << endl;
+
     /**
      * Disjunctive Search
      **/
     if (conj == false) {
         // Merge sorted lists
-        priority_queue <elem *, vector<elem *>, comp> merge_list;
+
+        priority_queue <elem *, vector<elem *>, comp> merge_buffer;
         for (int i = 0; i < num; i ++) {
             lp[i]->get_payload();
-            merge_list.push(new elem(i, 
+            merge_buffer.push(new elem(i, 
                 lp[i]->didlist[0],
                 lp[i]->freqlist[0],
-                lp[i]->scorelist[0],
-                lp[i]->urllist[0])
+                lp[i]->scorelist[0])
             );
         }
-        while (merge_list.empty() == false) {
-            elem*  e        = merge_list.top();
+        while (merge_buffer.empty() == false) {
+            elem*  e        = merge_buffer.top();
             uint32_t ind    = e->get_lp();
             uint32_t did    = e->get_did();
             uint32_t freq   = e->get_freq();
             double score    = e->get_score();
-            string url      = e->get_url();
             vector<pair<string, uint32_t> > occurrence;
+            vector<pair<string, double> >   term_score;
             occurrence.push_back(make_pair(lp[ind]->get_term(), freq));
+            term_score.push_back(make_pair(lp[ind]->get_term(), score));
             /** A pop is followed by a push **/
-            merge_list.pop();
+            merge_buffer.pop();
             if (lp[ind]->index < lp[ind]->get_ft() - 1) {
                 lp[ind]->index ++;
-                merge_list.push(new elem(ind,
+                merge_buffer.push(new elem(ind,
                     lp[ind]->didlist[lp[ind]->index],
                     lp[ind]->freqlist[lp[ind]->index],
-                    lp[ind]->scorelist[lp[ind]->index],
-                    lp[ind]->urllist[lp[ind]->index])
+                    lp[ind]->scorelist[lp[ind]->index])
                 );
             }
-            if (merge_list.empty()) break;
+            if (merge_buffer.empty()) break;
             /** If same docID **/
-            while ((merge_list.top())->get_did() == e->get_did()) {
-                elem* ee  = merge_list.top();
+            while ((merge_buffer.top())->get_did() == e->get_did()) {
+                elem* ee  = merge_buffer.top();
                 ind    = ee->get_lp();
                 freq   = ee->get_freq();
                 score += ee->get_score();
                 occurrence.push_back(make_pair(lp[ind]->get_term(), freq));
-                merge_list.pop();
+                term_score.push_back(make_pair(lp[ind]->get_term(), ee->get_score()));
+                merge_buffer.pop();
                 if (lp[ind]->index < lp[ind]->get_ft() - 1) {
                     lp[ind]->index ++;
-                    merge_list.push(new elem(ind,
+                    merge_buffer.push(new elem(ind,
                         lp[ind]->didlist[lp[ind]->index],
                         lp[ind]->freqlist[lp[ind]->index],
-                        lp[ind]->scorelist[lp[ind]->index],
-                        lp[ind]->urllist[lp[ind]->index])
+                        lp[ind]->scorelist[lp[ind]->index])
                     );
                 }
-                if (merge_list.empty()) break;
+                if (merge_buffer.empty()) break;
             }
-            pq.push(new result(did, url, score, occurrence));
+            if (pq.size() >= 10) {
+                if ((pq.top())->score < score) {
+                    pq.pop();
+                    pq.push(new result(did, score, occurrence, term_score));
+                }
+            } else {
+                pq.push(new result(did, score, occurrence, term_score));
+            }
         }
+
         // Display top-10 search result
+        string display[10];
         for (int i = 0; i < 10; i ++) {
             if (pq.empty()) break;
             result *r = pq.top();
-            cout << "\033[1;31m" << i << "\033[0m: " << r->url << endl;
             // Bind values to SQL statement
-            snippet->setString(1, r->url);
+            urldb->setInt(1, r->did);
             // Execute query
-            ResultSet *res = snippet->executeQuery();
-            cout << "   SCORE: " << r->score << endl;
-            cout << "      " << "TERM" << setw(15) << "FREQUENCY" << endl;
-            cout << "      -------------------" << endl;
+            ResultSet *res = urldb->executeQuery();
+            string url;
+            while (res->next()) {
+                url = res->getString(1);
+            }
+            display[i] += "\033[1;31m" + to_string(10 - i) + "\033[0m: " + url + "\n";
+            display[i] += "   SCORE: " + to_string(r->score) + "\n";
+            display[i] += "      TERM          FREQUENCY\n";
+            display[i] += "      -----------------------\n";
             for (int j = 0; j < r->occur2.size(); j ++) {
                 string term = r->occur2[j].first;
-                cout << "      " << term << setw(15 - term.size()) << r->occur2[j].second << endl;
+                display[i] += "      " + term + string(23 - term.size() - to_string(r->occur2[j].second).size(), ' ') + to_string(r->occur2[j].second) + "\n";
             }
-            cout << "      -------------------" << endl;
+            display[i] += "      -----------------------\n";
+            display[i] += "      TERM              SCORE\n";
+            display[i] += "      -----------------------\n";
+            for (int j = 0; j < r->ts2.size(); j ++) {
+                string term = r->ts2[j].first;
+                display[i] += "      " + term + string(23 - term.size() - to_string(r->ts2[j].second).size(), ' ') + to_string(r->ts2[j].second) + "\n";
+            }
+            display[i] += "      -----------------------\n";
+
+            // Bind values to SQL statement
+            contentdb->setString(1, url);
+            // Execute query
+            res = contentdb->executeQuery();
             while (res->next()) {
-                cout << "   SNIPPET: " << res->getString(1).substr(0, 500) << " ......" << endl;
+                display[i] += "   SNIPPET: " + res->getString(1).substr(0, 500) + " ......\n";
             }
-            cout << endl;
+            display[i] += "\n";
             pq.pop();
+        }
+        for (int i = 9; i >= 0; i --) {
+            cout << display[i];
         }
     }
 
@@ -367,10 +386,8 @@ void query_processer(vector<string> &terms, bool conj) {
      * Conjunctive Search
      **/
     if (conj == true) {
-        /* Sort according to list length(freq) */
+        /* Sort according to list length */
         sort(lp.begin(), lp.end(), list_comp);
-        // for (int i = 0; i < lp.size(); i ++)
-        //     cout << lp[i]->get_term() << ' ' << lp[i]->get_ft() << endl;
 
         int did = 0;
         while (true) {
@@ -389,38 +406,68 @@ void query_processer(vector<string> &terms, bool conj) {
                 did = d;
             } else {
                 // docID is in intersection; now get all frequencies/scores
-                vector<uint32_t> occurrence; 
+                vector<uint32_t> occurrence;
+                vector<double> term_score;
                 double score = 0.0;
                 for (int i = 0; i < num; i ++) {
                     score += lp[i]->get_score();
                     occurrence.push_back(lp[i]->get_current_fdt());
+                    term_score.push_back(lp[i]->get_score());
                 }
-                pq.push(new result(did, lp[0]->get_current_url(), score, occurrence));
+                if (pq.size() >= 10) {
+                    if ((pq.top())->score < score) {
+                        pq.pop();
+                        pq.push(new result(did, score, occurrence, term_score));
+                    }
+                } else {
+                    pq.push(new result(did, score, occurrence, term_score));
+                }
                 did ++;
             }
         }
+
         // Display top-10 search result
+        string display[10];
         for (int i = 0; i < 10; i ++) {
             if (pq.empty()) break;
             result *r = pq.top();
-            cout << "\033[1;31m" << i << "\033[0m: " << r->url << endl;
             // Bind values to SQL statement
-            snippet->setString(1, r->url);
+            urldb->setInt(1, r->did);
             // Execute query
-            ResultSet *res = snippet->executeQuery();
-            cout << "   SCORE: " << r->score << endl;
-            cout << "      " << "TERM" << setw(15) << "FREQUENCY" << endl;
-            cout << "      -------------------" << endl;
+            ResultSet *res = urldb->executeQuery();
+            string url;
+            while (res->next()) {
+                url = res->getString(1);
+            }
+            display[i] += "\033[1;31m" + to_string(10 - i) + "\033[0m: " + url + "\n";
+            display[i] += "   SCORE: " + to_string(r->score) + "\n";
+            display[i] += "      TERM          FREQUENCY\n";
+            display[i] += "      -----------------------\n";
             for (int j = 0; j < num; j ++) {
                 string term = lp[j]->get_term();
-                cout << "      " << term << setw(15 - term.size()) << r->occur1[j] << endl;
+                display[i] += "      " + term + string(23 - term.size() - to_string(r->occur1[j]).size(), ' ') + to_string(r->occur1[j]) + "\n";
             }
-            cout << "      -------------------" << endl;
+            display[i] += "      -----------------------\n";
+            display[i] += "      TERM              SCORE\n";
+            display[i] += "      -----------------------\n";
+            for (int j = 0; j < num; j ++) {
+                string term = lp[j]->get_term();
+                display[i] += "      " + term + string(23 - term.size() - to_string(r->ts1[j]).size(), ' ') + to_string(r->ts1[j]) + "\n";
+            }
+            display[i] += "      -----------------------\n";
+
+            // Bind values to SQL statement
+            contentdb->setString(1, url);
+            // Execute query
+            res = contentdb->executeQuery();
             while (res->next()) {
-                cout << "   SNIPPET: " << res->getString(1).substr(0, 500) << " ......" << endl;
+                display[i] += "   SNIPPET: " + res->getString(1).substr(0, 500) + " ......\n";
             }
-            cout << endl;
+            display[i] += "\n";
             pq.pop();
+        }
+        for (int i = 9; i >= 0; i --) {
+            cout << display[i];
         }
     }
 }
@@ -429,9 +476,6 @@ int main(int argc, char** argv) {
 
     bool conj = true;
 
-    // Record time
-    auto start = system_clock::now();
-
     // Create a new Statement
     Statement* select_db(conn->createStatement());
     // Execute query, select database
@@ -439,7 +483,13 @@ int main(int argc, char** argv) {
 
     cout << "Welcome to \033[1;31mCoocle\033[0m -- a mini web serach engine" << endl;
     cout << "            Type 'quit' to quit.             " << endl;
+    cout << "N     = 3213835" << endl;
+    cout << "d_avg =     993" << endl;
     cout << "---------------------------------------------" << endl;
+    cout << "Lexicon is stored in database...             " << endl;
+    cout << "Loading page table..............             " << endl;
+    pgsize_file.read(reinterpret_cast<char *>(&pgsize[0]), N * sizeof(pgsize[0]));
+    cout << "Done..............                           " << endl;
     bool quit = false;
     while (1) {
         string query;
@@ -473,19 +523,21 @@ int main(int argc, char** argv) {
         cout << "Searching..." << endl;
         vector<string> terms = split(query, ' ');
 
+        // Record time
+        auto start = system_clock::now();
         // Process query
         query_processer(terms, conj);
+        // Record time
+        auto end = system_clock::now();
+        auto duration = duration_cast<microseconds>(end - start);
+        cout << double(duration.count()) * microseconds::period::num / microseconds::period::den << 's' << endl;
+
         cout << "---------------------------------------------" << endl;
     }
 
     // Close files
-    inverted_index.close();
-    pgtable.close();
-
-    // Record time
-    auto end = system_clock::now();
-    auto duration = duration_cast<microseconds>(end - start);
-    cout << double(duration.count()) * microseconds::period::num / microseconds::period::den << 's' << endl;
+    inverted_index_file.close();
+    pgsize_file.close();
 
     return 0;
 }
