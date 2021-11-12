@@ -173,6 +173,11 @@ public:
     }
 
     int nextGEQ(int k) {
+        /**
+         * TODO
+         * check if a block has already been decoded.
+         */
+
         // block-wise decompression
         while (lastID[cblock] < k) {
             offset  += chukSZ[cblock];
